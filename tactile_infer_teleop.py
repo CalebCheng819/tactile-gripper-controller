@@ -53,7 +53,7 @@ from robot_inference_adapter import TactileGripperAdapter
 # TACTILE_MODEL_CHECKPOINT = "/home/pi0/multi-modal/tactile_module/checkpoints/two_img_delta_gripper_normalized.pt"
 # TACTILE_MODEL_CHECKPOINT = "/home/pi0/multi-modal/tactile_module/checkpoints/paper_cup_two_img_delta_gripper_normalized.pt"
 # TACTILE_MODEL_CHECKPOINT = "/home/pi0/multi-modal/tactile_module/checkpoints/1224_paper_cup_two_img_delta_gripper_normalized.pt"
-TACTILE_MODEL_CHECKPOINT = "/home/pi0/multi-modal/checkpoints/box_and_cup/checkpoints/ab_drop1_C1_seed42_drop_demo_20_20260220_203907_best.pt"
+TACTILE_MODEL_CHECKPOINT = "/home/pi0/multi-modal/checkpoints/box_and_cup/checkpoints/ab_full_C4_seed42_drop_demo_20_20260220_203907_best.pt"
 # Set to "auto" to infer matching config from checkpoint name (recommended).
 # You can still set an explicit yaml path if needed.
 TACTILE_MODEL_CONFIG = "auto"
@@ -64,6 +64,23 @@ TACTILE_MODEL_CONFIG_SEARCH_ROOTS = [
     "/home/pi0/multi-modal/tactile_module/experiments",
     "/home/pi0/multi-modal/tactile_module/configs",
 ]
+
+# Optional: auto-generate gripper normalization stats from a dataset.
+# Set to None/"" to disable, or override via env TACTILE_GRIPPER_STATS_SOURCE_H5.
+TACTILE_GRIPPER_STATS_SOURCE_H5 = os.getenv(
+    "TACTILE_GRIPPER_STATS_SOURCE_H5",
+    "/home/pi0/multi-modal/robomimic_output/action_target_gripper_position_50target_horizon_none_papercup_and_box_haiyi_100_delta.hdf5",
+).strip()
+if not TACTILE_GRIPPER_STATS_SOURCE_H5:
+    TACTILE_GRIPPER_STATS_SOURCE_H5 = None
+# Optional: override output stats path; "auto" writes next to the config file.
+TACTILE_GRIPPER_STATS_OUTPUT = os.getenv("TACTILE_GRIPPER_STATS_OUTPUT", "auto").strip()
+# Optional: "train" (default), "val", or "" for all data.
+TACTILE_GRIPPER_STATS_SPLIT = os.getenv("TACTILE_GRIPPER_STATS_SPLIT", "train").strip().lower()
+if TACTILE_GRIPPER_STATS_SPLIT in {"", "none", "all"}:
+    TACTILE_GRIPPER_STATS_SPLIT = None
+# Optional: recompute even if cached output exists.
+TACTILE_GRIPPER_STATS_REFRESH = os.getenv("TACTILE_GRIPPER_STATS_REFRESH", "0") == "1"
 
 # Run log settings (stdout + stderr tee to file for post-run debugging)
 TACTILE_SAVE_LOG = os.getenv("TACTILE_SAVE_LOG", "1") != "0"
@@ -280,12 +297,107 @@ def resolve_tactile_model_config(checkpoint_path, config_value):
     # 3) fallback
     fb = Path(TACTILE_MODEL_CONFIG_FALLBACK).expanduser()
     if fb.exists():
-        print(f"[INFO] Using fallback config: {fb}")
+        if TACTILE_GRIPPER_STATS_SOURCE_H5:
+            print(f"[INFO] Using base config for auto-generated stats: {fb}")
+        else:
+            print(f"[INFO] Using fallback config: {fb}")
         return str(fb.resolve())
 
     raise FileNotFoundError(
         "Failed to resolve TACTILE_MODEL_CONFIG. Set explicit path or ensure fallback exists."
     )
+
+
+def _resolve_gripper_stats_output_path(config_path, source_h5, output_spec):
+    config_file = Path(config_path).expanduser().resolve()
+    config_dir = config_file.parent
+    if output_spec and str(output_spec).strip().lower() not in {"auto", ""}:
+        out = Path(str(output_spec)).expanduser()
+        if not out.is_absolute():
+            out = (config_dir / out).resolve()
+        return out
+
+    dataset_tag = _sanitize_filename(Path(source_h5).stem)
+    config_tag = _sanitize_filename(config_file.stem)
+    return config_dir / f"{config_tag}__auto_{dataset_tag}_gripper_norm_stats.json"
+
+
+def _autogenerate_gripper_stats_from_h5(source_h5, gripper_key, split, output_path, refresh=False):
+    source_path = Path(source_h5).expanduser()
+    if not source_path.exists():
+        raise FileNotFoundError(f"Gripper stats source dataset not found: {source_path}")
+
+    if output_path.exists() and not refresh:
+        if output_path.stat().st_mtime >= source_path.stat().st_mtime:
+            print(f"[INFO] Using cached gripper normalization stats: {output_path}")
+            return output_path
+
+    try:
+        from compute_normalization_stats import compute_stats
+    except Exception as e:
+        raise ImportError(
+            f"Failed to import compute_normalization_stats (requires h5py). Error: {e}"
+        ) from e
+
+    print(f"[INFO] Auto-generating gripper normalization stats from: {source_path}")
+    stats = compute_stats(str(source_path), gripper_key=str(gripper_key), split=split)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(stats, indent=2))
+    print(f"[INFO] Wrote gripper normalization stats to: {output_path}")
+    return output_path
+
+
+def _write_config_with_gripper_stats(config_path, stats_path):
+    config_file = Path(config_path).expanduser().resolve()
+    with config_file.open("r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    if not isinstance(cfg, dict):
+        raise ValueError(f"Config file must be a YAML mapping: {config_file}")
+
+    rob = cfg.setdefault("robomimic", {})
+    rob["normalize_gripper"] = True
+    gripper_norm_cfg = rob.setdefault("gripper_normalization", {})
+    if "type" not in gripper_norm_cfg:
+        print("[WARNING] gripper_normalization.type missing; defaulting to 'symmetric'")
+        gripper_norm_cfg["type"] = "symmetric"
+
+    config_dir = config_file.parent
+    try:
+        rel_stats = stats_path.relative_to(config_dir)
+        gripper_norm_cfg["stats_file"] = str(rel_stats)
+    except Exception:
+        gripper_norm_cfg["stats_file"] = str(stats_path)
+
+    derived_path = config_dir / f"{config_file.stem}__autostats.yaml"
+    with derived_path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False)
+    print(f"[INFO] Wrote derived config with auto stats: {derived_path}")
+    return str(derived_path)
+
+
+def maybe_autogenerate_gripper_stats(config_path):
+    if not TACTILE_GRIPPER_STATS_SOURCE_H5:
+        return None
+
+    config_file = Path(config_path).expanduser().resolve()
+    with config_file.open("r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    rob = cfg.get("robomimic", {}) if isinstance(cfg, dict) else {}
+    gripper_key = rob.get("gripper_key", "obs/delta_gripper_position")
+
+    output_path = _resolve_gripper_stats_output_path(
+        config_path,
+        TACTILE_GRIPPER_STATS_SOURCE_H5,
+        TACTILE_GRIPPER_STATS_OUTPUT,
+    )
+    stats_path = _autogenerate_gripper_stats_from_h5(
+        TACTILE_GRIPPER_STATS_SOURCE_H5,
+        gripper_key,
+        TACTILE_GRIPPER_STATS_SPLIT,
+        output_path,
+        refresh=TACTILE_GRIPPER_STATS_REFRESH,
+    )
+    return _write_config_with_gripper_stats(config_path, stats_path)
 
 
 def load_normalization_stats(config_path=None, stats_file_path=None):
@@ -360,10 +472,17 @@ def load_normalization_stats(config_path=None, stats_file_path=None):
 
 # Resolve model config automatically when requested, then load normalization stats.
 TACTILE_MODEL_CONFIG = resolve_tactile_model_config(TACTILE_MODEL_CHECKPOINT, TACTILE_MODEL_CONFIG)
+_auto_cfg = maybe_autogenerate_gripper_stats(TACTILE_MODEL_CONFIG)
+if _auto_cfg:
+    TACTILE_MODEL_CONFIG = _auto_cfg
+TACTILE_GRIPPER_STATS_OVERRIDE = None
 print(f"[INFO] Using tactile model config: {TACTILE_MODEL_CONFIG}")
 
 # Load normalization parameters from config/stats file
-_norm_stats = load_normalization_stats(TACTILE_MODEL_CONFIG)
+_norm_stats = load_normalization_stats(
+    TACTILE_MODEL_CONFIG,
+    stats_file_path=TACTILE_GRIPPER_STATS_OVERRIDE,
+)
 if _norm_stats is None:
     raise FileNotFoundError(
         "Failed to load normalization stats file. "
