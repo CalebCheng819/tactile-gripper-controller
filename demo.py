@@ -1,0 +1,318 @@
+import hydra
+from omegaconf import DictConfig
+from FORTE.sensing.sensor import sensor_data_updater
+from FORTE.scripts.sys_utils import SharedRingBuffer, opencv_visualizer
+from multiprocessing import Process, Event
+from multiprocessing import Process, Lock
+
+from r2d2.controllers.oculus_controller import VRPolicy
+from r2d2.robot_env import RobotEnv
+from r2d2.user_interface.data_collector import DataCollecter
+from r2d2.user_interface.gui import RobotGUI
+from r2d2.misc.subprocess_utils import run_threaded_command
+import pinocchio as pin
+
+import os
+import sys
+
+import numpy as np
+import copy
+import time
+
+cwd = os.getcwd()
+sys.path.append(cwd)
+
+from util import geom
+from devices import SpaceMouse, Keyboard
+import signal
+
+
+def vec_to_reorder_mat(vec):
+    X = np.zeros((len(vec), len(vec)))
+    for i in range(X.shape[0]):
+        ind = int(abs(vec[i])) - 1
+        X[i, ind] = np.sign(vec[i])
+    return X
+
+
+class HIDReader:
+    
+    def __init__(self, spacemouse=None, keyboard=None, debug: bool = False, **kwargs) -> None:
+        self._spacemouse = spacemouse
+        self._keyboard = keyboard
+        self._debug = debug
+        if self._spacemouse is not None:
+            self._spacemouse.start()
+        if self._keyboard is not None:
+            self._keyboard.start()
+
+        self._hid_values = {
+            "poses": {"r": np.eye(4)},
+            "buttons": {"A": False, "B": False, "X": False, "Y": False, "RG": False, "RJ": False, "rightTrig": [0.0]},
+        }
+
+        if self._debug:
+            print("\n[DEBUG] HIDReader initialized")
+            print("  initial transformation matrix:\n", self._hid_values["poses"]["r"])
+            print("  initial buttons:", self._hid_values["buttons"])
+
+    def get_transformations_and_buttons(self):
+
+        if self._spacemouse is not None:
+            inp = self._spacemouse.control
+            rot_mat = np.eye(4)
+            rot_mat[:3, :3] = geom.euler_to_rot(np.array([inp[4], inp[3], inp[5]]))
+            rot_mat[:3, 3]= np.array([inp[0], inp[1], inp[2]])
+            self._hid_values["poses"]["r"] = rot_mat
+            self._hid_values["buttons"].update({key: [value] for key, value in self._keyboard.scalars.items()})
+        if self._keyboard is not None:
+            self._hid_values["buttons"].update(self._keyboard.buttons)
+
+        # print("Current HID Values:", self._hid_values)
+        return copy.copy(self._hid_values["poses"]), copy.copy(self._hid_values["buttons"])
+
+    @property
+    def idle(self):
+        if self._spacemouse is None:
+            return True
+        else:
+            return self._spacemouse.idle
+    @property
+    def hid_values(self):
+        return self._hid_values
+    
+    def reset(self):
+        if self._spacemouse is not None:
+            self._spacemouse.reset()
+        if self._keyboard is not None:
+            self._keyboard.reset()
+
+        self._hid_values["poses"]["r"] = np.eye(4)
+        self._hid_values["buttons"] = {"A": False, "B": False, "X": False, "Y": False, "RG": False, "RJ": False, "rightTrig": [0.0]}
+        # print("def reset")
+    def force_set_grasping(self, grasping):
+        self._keyboard._scalars["rightTrig"] = grasping
+
+
+class HITLPolicy(VRPolicy):
+    def __init__(
+        self,
+        devices,
+        robot_env=None,
+        right_controller: bool = True,
+        max_lin_vel: float = 1,
+        max_rot_vel: float = 1,
+        max_gripper_vel: float = 1,
+        spatial_coeff: float = 1,
+        pos_action_gain: float = 5,
+        rot_action_gain: float = 2,
+        gripper_action_gain: float = 3,
+        rmat_reorder: list = [-2, -1, -3, 4],
+        **kwargs
+    ):
+        self.oculus_reader = HIDReader(**devices, debug=True)
+        self.robot_env = robot_env
+        self.vr_to_global_mat = np.eye(4)
+        self.max_lin_vel = max_lin_vel
+        self.max_rot_vel = max_rot_vel
+        self.max_gripper_vel = max_gripper_vel
+        self.spatial_coeff = spatial_coeff
+        self.pos_action_gain = pos_action_gain
+        self.rot_action_gain = rot_action_gain
+        self.gripper_action_gain = gripper_action_gain
+        self.global_to_env_mat = vec_to_reorder_mat(rmat_reorder)
+        self.controller_id = "r" if right_controller else "l"
+        self.reset_orientation = True
+        self._instruction = "No instruction provided."
+        self.reset_state()
+
+        # Start State Listening Thread #
+        run_threaded_command(self._update_internal_state)
+
+        # self._model = pin.buildModelFromUrdf("/home/soroush/code/droid_mingyo/model/panda.urdf", pin.JointModelFreeFlyer())
+
+        # Jaelyn solving urdf error -- matching with mingyo_test
+        self._model = pin.buildModelFromUrdf("/home/pi0/multi-modal/droid-multi-modal/model/panda.urdf", pin.JointModelFreeFlyer())
+
+        self._data = self._model.createData()
+        self._link_idx_hand = self._model.getFrameId("panda_link8")
+        self._previous_action = None
+
+    def forward(self, obs_dict, include_info=False):
+
+        assert self.robot_env.action_space in ["cartesian_velocity", "joint_velocity"]
+
+        if self.robot_env.action_space == "cartesian_velocity":
+            return super().forward(obs_dict, include_info=include_info)
+        else:
+            out = super().forward(obs_dict, include_info=include_info)
+            robot_state = obs_dict["robot_state"]
+            if include_info:
+                cartesian_action, info = out
+                joint_action = self.cartesian_velocity_to_joint_velocity(
+                    cartesian_action, robot_state
+                ).tolist()
+                joint_action = joint_action + [cartesian_action[-1]]
+                return np.clip(joint_action, -1, 1), info
+            else:
+                cartesian_action = out
+                joint_action = self.cartesian_velocity_to_joint_velocity(
+                    cartesian_action, robot_state
+                ).tolist()
+                joint_action = joint_action + [cartesian_action[-1]]
+                return np.clip(joint_action, -1, 1)
+
+    def cartesian_velocity_to_joint_velocity(self, cartesian_action, robot_state):
+        cur_q = np.array([0] * 7 + robot_state["joint_positions"])
+        pin.forwardKinematics(self._model, self._data, cur_q)
+        J_hand = pin.computeFrameJacobian(self._model, self._data, cur_q, self._link_idx_hand, pin.LOCAL_WORLD_ALIGNED)[:,6:]
+        local_hand_vel = np.array(cartesian_action[:-1])
+        joint_action = np.linalg.pinv(J_hand) @ local_hand_vel
+        return joint_action  # Exclude gripper action
+
+    def get_dummy_action(self, obs_dict, include_info=False):
+        if self.robot_env.action_space == "cartesian_velocity":
+            dummy_action = np.zeros(7)
+        else:
+            dummy_action = np.zeros(8)
+        if include_info:
+            return dummy_action, {}
+        else:
+            return dummy_action
+
+    def reset_state(self):
+        super().reset_state()
+        self.oculus_reader.reset()
+        # print("def reset_state")
+        # print("  initial HID pose after reset:\n", self.oculus_reader.hid_values["poses"]["r"])
+
+    
+    def set_instruction(self, instruction):
+        self._instruction = instruction
+
+    @property
+    def instruction(self):
+        return self._instruction
+    
+
+class babyFORTEReader:
+    def __init__(self, cfg, shutdown_event) -> None:
+
+        # Shared memory configuration
+        BUFFER_SIZE = 50000  # Number of samples in the ring buffer
+        NUM_CHANNELS = 6    # 6 sensor channels
+
+        self.shared_sensor_buffer = SharedRingBuffer(BUFFER_SIZE, NUM_CHANNELS, 'd')
+
+        self.sensor_process = Process(
+            target=sensor_data_updater,
+            args=(cfg.elvrgripper, self.shared_sensor_buffer),
+            kwargs={'mode': 'process', 'shutdown_event': shutdown_event},
+        )
+        self.sensor_process.start()
+        time.sleep(2)  # Ensure the sensor process starts before reading
+
+        self.visualizer_process = Process(
+            target=opencv_visualizer,
+            args=(self.shared_sensor_buffer, cfg.buffer, None, None, shutdown_event)
+        )
+        self.visualizer_process.start()
+
+        self.shutdown_event = shutdown_event
+        self._test_cnt = 1
+
+    def update_values(self):
+        self._test_cnt += 1
+
+    def read_values(self):
+        if self.shared_sensor_buffer.is_empty():
+            return np.zeros((self.shared_sensor_buffer.num_channels,))
+
+        # Read the latest sensor values from the shared buffer
+        # sensor_values = self.shared_sensor_buffer.get_latest()
+
+
+        # Read the sensor data of the last 5 seconds
+        sensor_values = self.shared_sensor_buffer.get_latest_freq_history()
+
+        # print(sensor_values.shape)
+        # sensor_values = None
+        return sensor_values
+
+    def close(self):
+        print("Shutting down processes...")
+        self.shutdown_event.set()
+         
+        self.visualizer_process.terminate()
+        self.visualizer_process.join()
+        self.sensor_process.terminate()
+        # force_estimator_process.terminate()
+        # slip_predictor_process.terminate()
+        # gripper_process.terminate()
+
+        time.sleep(2)
+        print("Cleaning up resources...")
+        self.sensor_process.kill()
+        # force_estimator_process.kill()
+        # slip_predictor_process.kill()
+        # gripper_process.kill()
+        self.sensor_process.join(timeout=1)
+        # force_estimator_process.join(timeout=1)
+        # slip_predictor_process.join(timeout=1)
+        # gripper_process.join(timeout=1)
+        self.shared_sensor_buffer.close()
+        # force_buffer.close()
+        # slip_buffer.close()
+        print("Demo completed. Resources cleaned up.")
+
+
+class HumanInterventionReader:
+    def __init__(self, spacemouse=None, keyboard=None):
+        self._spacemouse = spacemouse
+        self._keyboard = keyboard
+        self._idle = self._spacemouse.idle
+
+    def update_values(self):
+        self._idle = self._spacemouse.idle
+
+    def read_values(self):
+        self.update_values()
+        return self._idle
+
+
+@hydra.main(config_path="../FORTE/config/", config_name="baby_FORTE")
+def main(cfg: DictConfig):
+
+    devices = {"spacemouse": SpaceMouse(reset_with_idle=True), "keyboard": Keyboard()}
+    # devices = {"keyboard": Keyboard()}
+
+    shutdown_event = Event()
+
+    def handle_exit(signum, frame):
+        print(f"Signal {signum} received. Exiting...")
+        shutdown_event.set()
+
+    signal.signal(signal.SIGINT, handle_exit)
+    signal.signal(signal.SIGTERM, handle_exit)
+
+    try:        
+
+        tactile_reader = babyFORTEReader(cfg, shutdown_event)
+        devices = {"spacemouse": SpaceMouse(reset_with_idle=False), "keyboard": Keyboard()}
+        # env = RobotEnv(action_space="joint_velocity", sensor_readers={"tactile_values":DummyTactileReader(), "human_intervention": HumanInterventionReader(**devices)})
+        env = RobotEnv(action_space="joint_velocity", sensor_readers={"tactile_values":tactile_reader, "human_intervention": HumanInterventionReader(**devices)})
+        controller = HITLPolicy(devices, robot_env=env)
+
+        # Make the data collector
+        data_collector = DataCollecter(env=env, controller=controller)
+
+        # Make the GUI
+        user_interface = RobotGUI(robot=data_collector)
+    
+    finally:
+        print("Cleaning up resources...")
+        tactile_reader.close()
+        print("Resources cleaned up.")
+
+if __name__ == "__main__":
+    main()  
