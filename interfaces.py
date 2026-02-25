@@ -98,6 +98,9 @@ class OpenPIWrapper:
         self._pred_action_chunk = None
         self._instruction = "No instruction provided."
         self._start_time = time.time()
+        self._last_request_keys = []
+        self._last_has_tactile_values = False
+        self._last_prompt_len = 0
 
 
     def set_instruction(self, instruction):
@@ -109,14 +112,29 @@ class OpenPIWrapper:
 
     def forward(self, obs_dict, include_info=False):
         start_time = time.time()
+        request_keys = self._last_request_keys
+        has_tactile_values = self._last_has_tactile_values
+        prompt_len = self._last_prompt_len
+        chunk_reused = False
+        chunk_index = -1
 
         try:
             # Get the current observation
             robot_states = obs_dict["robot_state"]
             curr_obs = extract_observation(self.config, obs_dict)
 
+            chunk = self._pred_action_chunk
+            chunk_len = len(chunk) if chunk is not None else 0
+            horizon = min(int(self.config.open_loop_horizon), chunk_len) if chunk_len > 0 else 0
+            need_query = (
+                chunk is None
+                or self._actions_from_chunk_completed == 0
+                or self._actions_from_chunk_completed >= max(1, horizon)
+                or self._actions_from_chunk_completed >= chunk_len
+            )
+
             # Send websocket request to policy server if it's time to predict a new chunk
-            if self._actions_from_chunk_completed == 0 or self._actions_from_chunk_completed >= self.config.open_loop_horizon:
+            if need_query:
                 self._actions_from_chunk_completed = 0
 
                 # We resize images on the robot laptop to minimize the amount of data sent to the policy server
@@ -128,16 +146,34 @@ class OpenPIWrapper:
                     "observation/wrist_image_left": image_tools.resize_with_pad(curr_obs["wrist_image"], 224, 224),
                     "observation/joint_position": curr_obs["joint_position"],
                     "observation/gripper_position": curr_obs["gripper_position"],
-                    "observation/tactile_values": np.array(robot_states["tactile_values"]).flatten(),
                     "prompt": self.instruction,
                 }
+                tactile_values = robot_states.get("tactile_values", None)
+                if tactile_values is not None:
+                    request_data["observation/tactile_values"] = np.array(tactile_values, dtype=np.float32).flatten()
+                    has_tactile_values = True
+                else:
+                    request_data["observation/tactile_values"] = np.zeros((6,), dtype=np.float32)
+                    has_tactile_values = False
+                    if not hasattr(self, "_warned_missing_tactile_values"):
+                        print("[WARNING] robot_state missing tactile_values; sending zeros to PI0.")
+                        self._warned_missing_tactile_values = True
+
+                request_keys = sorted(request_data.keys())
+                prompt_len = len(str(request_data.get("prompt", "")))
 
                 # this returns action chunk [10, 8] of 10 joint velocity actions (7) + gripper position (1)
                 self._pred_action_chunk = self.policy_client.infer(request_data)["actions"]
                 # print(self._pred_action_chunk.shape)
                 # assert self._pred_action_chunk.shape == (10, 8)
+                self._last_request_keys = request_keys
+                self._last_has_tactile_values = has_tactile_values
+                self._last_prompt_len = prompt_len
+            else:
+                chunk_reused = True
 
             # Select current action to execute from chunk
+            chunk_index = self._actions_from_chunk_completed
             action = self._pred_action_chunk[self._actions_from_chunk_completed]
             self._actions_from_chunk_completed += 1
 
@@ -156,10 +192,18 @@ class OpenPIWrapper:
             action = np.zeros(8)
     
         if include_info:
+            chunk_len = len(self._pred_action_chunk) if self._pred_action_chunk is not None else 0
             info = {
                 "action_chunk": self._pred_action_chunk,
                 "actions_from_chunk_completed": self._actions_from_chunk_completed,
                 "time": time.time() - start_time,
+                "request_keys": request_keys,
+                "chunk_len": chunk_len,
+                "chunk_index": chunk_index,
+                "chunk_reused": chunk_reused,
+                "open_loop_horizon": int(self.config.open_loop_horizon),
+                "prompt_len": int(prompt_len),
+                "has_tactile_values": bool(has_tactile_values),
             }
             return action, info
         else:
