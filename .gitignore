@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+
+# Logs
+logs/
+*.
+
+log
+
+# Data
+*.h5
+*.csv
+
+# Jupyter
+*.ipynb
+
+# Outputs
+outputs/
+visualizations/videos/
+evaluation/results.ipynb
+
+# Sensor dumps
+sensor_log_*.csv
+
+# Local docs
+*.md
+
+# Misc
+=*
