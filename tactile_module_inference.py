@@ -54,7 +54,7 @@ for extra_path in (repo_root, tactile_module_dir, scripts_dir):
 
 # Ensure openpi_client is importable.
 try:
-    from openpi_client import image_tools, websocket_client_policy
+    import openpi_client  # noqa: F401
 except Exception:
     openpi_client_paths = [
         repo_root / "openpi" / "packages" / "openpi-client" / "src",
@@ -64,7 +64,7 @@ except Exception:
     for path in openpi_client_paths:
         if path.exists() and str(path) not in sys.path:
             sys.path.insert(0, str(path))
-    from openpi_client import image_tools, websocket_client_policy
+    import openpi_client  # noqa: F401
 
 # Ensure oculus_reader is in path (for editable installs).
 oculus_reader_path = scripts_dir / "src" / "oculus_reader"
@@ -88,8 +88,15 @@ PI0_SHADOW_LOG_EVERY = max(1, int(os.getenv("PI0_SHADOW_LOG_EVERY", "50")))
 PI0_REMOTE_HOST = os.getenv("PI0_REMOTE_HOST", "127.0.1.1").strip()
 PI0_REMOTE_PORT = int(os.getenv("PI0_REMOTE_PORT", "8000"))
 PI0_OPEN_LOOP_HORIZON = max(1, int(os.getenv("PI0_OPEN_LOOP_HORIZON", "4")))
-PI0_INCLUDE_TACTILE_VALUES = os.getenv("PI0_INCLUDE_TACTILE_VALUES", "1") != "0"
+PI0_INCLUDE_TACTILE_VALUES = os.getenv("PI0_INCLUDE_TACTILE_VALUES", "0") != "0"
 PI0_INCLUDE_FORCE_PREDICTION = os.getenv("PI0_INCLUDE_FORCE_PREDICTION", "0") != "0"
+PI0_IO_CONTRACT = os.getenv("PI0_IO_CONTRACT", "auto").strip().lower()
+PI0_IO_FALLBACK_ORDER = os.getenv(
+    "PI0_IO_FALLBACK_ORDER",
+    "base,tactile,tactile_force,force",
+).strip()
+PI0_PROTOCOL_MAX_RETRIES = max(0, int(os.getenv("PI0_PROTOCOL_MAX_RETRIES", "2")))
+PI0_PROTOCOL_RECONNECT_ON_ERROR = os.getenv("PI0_PROTOCOL_RECONNECT_ON_ERROR", "1") != "0"
 PI0_ARM_ACTION_MODE = os.getenv("PI0_ARM_ACTION_MODE", "joint_velocity").strip().lower()
 PI0_JOINT_DELTA_MAX = float(os.getenv("PI0_JOINT_DELTA_MAX", "0.2"))
 PI0_ARM_POS_EPS = float(os.getenv("PI0_ARM_POS_EPS", "0.003"))
@@ -107,6 +114,9 @@ PI0_GRASP_HYSTERESIS = float(os.getenv("PI0_GRASP_HYSTERESIS", "0.03"))
 PI0_GRIPPER_BIN_THRESHOLD = float(
     os.getenv("PI0_GRIPPER_BIN_THRESHOLD", str(PI0_GRASP_THRESHOLD))
 )
+PI0_TACTILE_MIN_HOLD_STEPS = max(0, int(os.getenv("PI0_TACTILE_MIN_HOLD_STEPS", "8")))
+PI0_TACTILE_RELEASE_CONSEC_STEPS = max(1, int(os.getenv("PI0_TACTILE_RELEASE_CONSEC_STEPS", "2")))
+PI0_TACTILE_GRIPPER_MIN_CMD = float(os.getenv("PI0_TACTILE_GRIPPER_MIN_CMD", "0.0"))
 PI0_EE_Z_WARN = float(os.getenv("PI0_EE_Z_WARN", "0.22"))
 _PI0_EE_Z_HARD_MIN_RAW = os.getenv("PI0_EE_Z_HARD_MIN", "0.19").strip()
 PI0_EE_Z_HARD_MIN = float(_PI0_EE_Z_HARD_MIN_RAW) if _PI0_EE_Z_HARD_MIN_RAW else None
@@ -162,6 +172,34 @@ TACTILE_RUN_LOG_DIR = os.getenv(
 def _sanitize_filename(name):
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name))
     return safe.strip("._-") or "run"
+
+
+def _parse_io_fallback_order(raw):
+    order = []
+    for item in str(raw or "").split(","):
+        key = item.strip().lower()
+        if key and key not in order:
+            order.append(key)
+    if not order:
+        order = ["base", "tactile", "tactile_force", "force"]
+    return tuple(order)
+
+
+def _log_pi0_provider_contract_state(provider_name, provider):
+    server_metadata = getattr(provider, "server_metadata", None)
+    if server_metadata:
+        print(f"[INFO] {provider_name} server metadata: {server_metadata}")
+    else:
+        print(f"[INFO] {provider_name} server metadata: <empty>")
+
+    contract = getattr(provider, "io_contract_active", None)
+    order = getattr(provider, "io_contract_order", None)
+    retries = getattr(provider, "protocol_max_retries", None)
+    if contract is not None and order is not None:
+        print(
+            f"[INFO] {provider_name} io_contract active={contract}, "
+            f"fallback_order={order}, max_retries={retries}"
+        )
 
 
 class _TeeStream:
@@ -265,6 +303,13 @@ if not 0.0 <= PI0_GRASP_THRESHOLD <= 1.0:
 if not 0.0 <= PI0_GRIPPER_BIN_THRESHOLD <= 1.0:
     print(f"[WARNING] PI0_GRIPPER_BIN_THRESHOLD={PI0_GRIPPER_BIN_THRESHOLD} outside [0,1], clamping.")
     PI0_GRIPPER_BIN_THRESHOLD = float(np.clip(PI0_GRIPPER_BIN_THRESHOLD, 0.0, 1.0))
+
+if not 0.0 <= PI0_TACTILE_GRIPPER_MIN_CMD <= 1.0:
+    print(
+        "[WARNING] PI0_TACTILE_GRIPPER_MIN_CMD="
+        f"{PI0_TACTILE_GRIPPER_MIN_CMD} outside [0,1], clamping."
+    )
+    PI0_TACTILE_GRIPPER_MIN_CMD = float(np.clip(PI0_TACTILE_GRIPPER_MIN_CMD, 0.0, 1.0))
 
 if PI0_EE_Z_WARN < 0.0:
     print(f"[WARNING] PI0_EE_Z_WARN={PI0_EE_Z_WARN} < 0, clamping to 0.")
@@ -649,125 +694,11 @@ def _delay_keyboard_interrupt():
             raise KeyboardInterrupt
 
 
-class Pi0ActionBridge:
-    """Direct PI0 websocket provider mirroring OpenPIWrapper request semantics."""
+class Pi0ActionBridge(OpenPIWrapper):
+    """Bridge provider that reuses OpenPIWrapper's I/O contract handling."""
 
     def __init__(self, config: OpenPIConfigs):
-        self.config = config
-        self.policy_client = websocket_client_policy.WebsocketClientPolicy(config.remote_host, config.remote_port)
-        self.reset()
-
-    def reset(self):
-        self._actions_from_chunk_completed = 0
-        self._pred_action_chunk = None
-        self._instruction = "No instruction provided."
-        self._start_time = time.time()
-        self._last_request_keys = []
-        self._last_has_tactile_values = False
-        self._last_prompt_len = 0
-
-    def set_instruction(self, instruction):
-        self._instruction = instruction
-
-    @property
-    def instruction(self):
-        return self._instruction
-
-    def _build_request_data(self, obs_dict):
-        robot_states = obs_dict["robot_state"]
-        curr_obs = extract_observation(self.config, obs_dict)
-
-        request_data = {
-            "observation/exterior_image_1_left": image_tools.resize_with_pad(
-                curr_obs[f"{self.config.external_camera}_image"], 224, 224
-            ),
-            "observation/wrist_image_left": image_tools.resize_with_pad(curr_obs["wrist_image"], 224, 224),
-            "observation/joint_position": curr_obs["joint_position"],
-            "observation/gripper_position": curr_obs["gripper_position"],
-            "prompt": self.instruction,
-        }
-
-        if PI0_INCLUDE_TACTILE_VALUES and "tactile_values" in robot_states:
-            request_data["observation/tactile_values"] = np.array(robot_states["tactile_values"]).flatten()
-
-        if PI0_INCLUDE_FORCE_PREDICTION:
-            force_prediction = robot_states.get("force_prediction")
-            if force_prediction is not None:
-                request_data["observation/force_prediction"] = np.array(force_prediction).flatten()
-
-        return request_data
-
-    def forward(self, obs_dict, include_info=False):
-        start_time = time.time()
-        request_keys = self._last_request_keys
-        has_tactile_values = self._last_has_tactile_values
-        prompt_len = self._last_prompt_len
-        chunk_reused = False
-        chunk_index = -1
-
-        chunk = self._pred_action_chunk
-        chunk_len = len(chunk) if chunk is not None else 0
-        horizon = min(self.config.open_loop_horizon, chunk_len) if chunk_len > 0 else 0
-        need_query = (
-            chunk is None
-            or self._actions_from_chunk_completed == 0
-            or self._actions_from_chunk_completed >= horizon
-            or self._actions_from_chunk_completed >= chunk_len
-        )
-
-        if need_query:
-            request_data = self._build_request_data(obs_dict)
-            request_keys = sorted(request_data.keys())
-            has_tactile_values = "observation/tactile_values" in request_data
-            prompt_len = len(str(request_data.get("prompt", "")))
-
-            try:
-                response = self.policy_client.infer(request_data)
-                actions = response.get("actions") if isinstance(response, dict) else None
-                if actions is None:
-                    raise KeyError("PI0 bridge response missing 'actions'.")
-                self._pred_action_chunk = np.asarray(actions, dtype=np.float32)
-                self._actions_from_chunk_completed = 0
-                self._last_request_keys = request_keys
-                self._last_has_tactile_values = has_tactile_values
-                self._last_prompt_len = prompt_len
-            except Exception:
-                # Reuse remaining chunk when available.
-                if chunk is not None and self._actions_from_chunk_completed < chunk_len:
-                    chunk_reused = True
-                else:
-                    raise
-        else:
-            chunk_reused = True
-
-        chunk = self._pred_action_chunk
-        if chunk is None:
-            raise RuntimeError("PI0 bridge has no action chunk available.")
-
-        chunk_len = len(chunk)
-        if self._actions_from_chunk_completed >= chunk_len:
-            raise RuntimeError("PI0 bridge chunk exhausted without refresh.")
-
-        chunk_index = self._actions_from_chunk_completed
-        action = np.asarray(chunk[chunk_index], dtype=np.float32).reshape(-1)
-        self._actions_from_chunk_completed += 1
-        action = np.clip(action, -1, 1)
-
-        if include_info:
-            info = {
-                "action_chunk": chunk,
-                "actions_from_chunk_completed": self._actions_from_chunk_completed,
-                "time": time.time() - start_time,
-                "request_keys": request_keys,
-                "chunk_len": chunk_len,
-                "chunk_index": chunk_index,
-                "chunk_reused": chunk_reused,
-                "open_loop_horizon": int(self.config.open_loop_horizon),
-                "prompt_len": int(prompt_len),
-                "has_tactile_values": bool(has_tactile_values),
-            }
-            return action, info
-        return action
+        super().__init__(config)
 
 
 class HybridPolicy:
@@ -817,12 +748,16 @@ class HybridPolicy:
         self._pi0_arm_high_sat_streak = 0
         self._pi0_gripper_counter = 0
         self._pi0_gripper_high_seen = False
+        self._tactile_hold_steps_left = 0
+        self._tactile_release_streak = 0
         self._state_counter = 0
         self._prev_ee_z = None
         self._prev_ee_t = None
         self._low_z_warn_counter = 0
         self._low_z_hard_guard_counter = 0
         self._pos_mode_mismatch_streak = 0
+        self._gripper_semantic_abnormal_streak = 0
+        self._gripper_semantic_warned = False
 
         self._shadow_count = 0
         self._shadow_linf_samples = []
@@ -1143,12 +1078,47 @@ class HybridPolicy:
             f"[PI0 GRIPPER] step={self._pi0_gripper_counter} "
             f"raw={pi0_gripper_raw:+.5f} active={int(is_grasping)} "
             f"activate>{activation_threshold:.3f} deactivate<{deactivation_threshold:.3f} "
-            f"bin>{self.gripper_bin_threshold:.3f}"
+            f"bin>{self.gripper_bin_threshold:.3f} "
+            f"hold_left={self._tactile_hold_steps_left} release_streak={self._tactile_release_streak}"
         )
         if not self._pi0_gripper_high_seen and self._pi0_gripper_counter >= 100:
             print(
                 "[WARNING] PI0 gripper raw signal has never crossed activation threshold "
                 f"({activation_threshold:.3f}) in {self._pi0_gripper_counter} steps."
+            )
+
+    def _check_gripper_semantic_mismatch(self, pi0_info):
+        if self._gripper_semantic_warned:
+            return
+        if not isinstance(pi0_info, dict):
+            return
+
+        raw_v = None
+        chunk = pi0_info.get("action_chunk")
+        chunk_index = int(pi0_info.get("chunk_index", -1))
+        if chunk is not None and chunk_index >= 0:
+            try:
+                row = np.asarray(chunk[chunk_index], dtype=np.float32).reshape(-1)
+                if row.size >= 8:
+                    raw_v = float(row[7])
+            except Exception:
+                raw_v = None
+
+        if raw_v is None:
+            return
+
+        abnormal = (not np.isfinite(raw_v)) or (abs(raw_v) > 2.5)
+        if abnormal:
+            self._gripper_semantic_abnormal_streak += 1
+        else:
+            self._gripper_semantic_abnormal_streak = 0
+
+        if self._gripper_semantic_abnormal_streak >= 20:
+            self._gripper_semantic_warned = True
+            print(
+                "[WARNING] PI0 action dim-8 (gripper) shows sustained abnormal range "
+                f"(abs(raw)>2.5 for {self._gripper_semantic_abnormal_streak} steps). "
+                "Contract/action semantics may be mismatched."
             )
 
     def _fallback_action(self):
@@ -1216,6 +1186,42 @@ class HybridPolicy:
             return pi0_gripper_raw > (self.grasp_threshold - self.hysteresis)
         return pi0_gripper_raw > (self.grasp_threshold + self.hysteresis)
 
+    def _update_tactile_latch(self, is_grasping):
+        """Apply hold/release hysteresis so tactile override does not flap every step."""
+        activated = False
+        deactivated = False
+
+        if self.tactile_adapter is None:
+            if self.tactile_active:
+                deactivated = True
+            self.tactile_active = False
+            self._tactile_hold_steps_left = 0
+            self._tactile_release_streak = 0
+            return activated, deactivated
+
+        if self.tactile_active:
+            if self._tactile_hold_steps_left > 0:
+                self._tactile_hold_steps_left -= 1
+                is_grasping = True
+
+            if is_grasping:
+                self._tactile_release_streak = 0
+            else:
+                self._tactile_release_streak += 1
+
+            if self._tactile_release_streak >= PI0_TACTILE_RELEASE_CONSEC_STEPS:
+                self.tactile_active = False
+                deactivated = True
+                self._tactile_hold_steps_left = 0
+                self._tactile_release_streak = 0
+        elif is_grasping:
+            self.tactile_active = True
+            activated = True
+            self._tactile_hold_steps_left = PI0_TACTILE_MIN_HOLD_STEPS
+            self._tactile_release_streak = 0
+
+        return activated, deactivated
+
     def _build_arm_command(self, pi0_action, obs_dict, action_space):
         arm_raw = np.asarray(pi0_action[:7], dtype=np.float32)
         if PI0_ARM_ACTION_MODE == "joint_position" and "velocity" in action_space:
@@ -1267,6 +1273,8 @@ class HybridPolicy:
             merged_action = np.asarray(merged_action, dtype=np.float32).reshape(-1)
             if merged_action.size < 8:
                 raise ValueError(f"Invalid merged action shape: {merged_action.shape}")
+            if PI0_TACTILE_GRIPPER_MIN_CMD > 0.0:
+                merged_action[7] = max(float(merged_action[7]), PI0_TACTILE_GRIPPER_MIN_CMD)
 
             self._tactile_fail_count = 0
             return merged_action[:8], float(tactile_delta)
@@ -1290,6 +1298,10 @@ class HybridPolicy:
         if pi0_action is None:
             action = self._fallback_action()
             if include_info:
+                contract_active = getattr(self.primary_provider, "io_contract_active", None)
+                contract_switch_count = getattr(self.primary_provider, "_io_contract_switch_count", None)
+                contract_attempts = getattr(self.primary_provider, "_io_contract_attempts", None)
+                last_protocol_error = getattr(self.primary_provider, "_last_protocol_error", None)
                 info = {
                     "tactile_active": False,
                     "pi0_error": str(pi0_error),
@@ -1297,11 +1309,16 @@ class HybridPolicy:
                     "tactile_fail_count": self._tactile_fail_count,
                     "robot_stopped": self.should_stop,
                     "pi0_provider": PI0_PROVIDER,
+                    "io_contract_active": contract_active,
+                    "io_contract_attempts": contract_attempts,
+                    "io_contract_switch_count": contract_switch_count,
+                    "last_protocol_error": last_protocol_error,
                 }
                 return action, info
             return action
 
         self._log_pi0_action(pi0_action, pi0_info)
+        self._check_gripper_semantic_mismatch(pi0_info)
         self._run_shadow_compare(obs_dict, pi0_action, pi0_info)
 
         action_space = "joint_velocity"
@@ -1313,23 +1330,35 @@ class HybridPolicy:
 
         pi0_gripper_raw = float(pi0_action[7])
         is_grasping = self._is_grasping(pi0_gripper_raw)
-        self._log_pi0_gripper(pi0_gripper_raw, is_grasping)
+        activated, deactivated = self._update_tactile_latch(is_grasping)
+        self._log_pi0_gripper(pi0_gripper_raw, self.tactile_active)
         ee_z = self._get_ee_z(obs_dict)
         self._log_state(ee_z, arm_cmd, pi0_gripper_raw)
         arm_cmd = self._guard_low_z(ee_z, arm_cmd, pi0_gripper_raw)
 
-        if is_grasping and self.tactile_adapter is not None and not self.tactile_active:
+        if activated:
             z_msg = "NA" if ee_z is None else f"{ee_z:.4f}"
-            print(f"[TACTILE] Activated - pi0 grasping signal: {pi0_gripper_raw:.3f}, ee_z={z_msg}")
-        if (not is_grasping) and self.tactile_active:
+            print(
+                "[TACTILE] Activated - "
+                f"pi0 grasping signal: {pi0_gripper_raw:.3f}, ee_z={z_msg}, "
+                f"min_hold_steps={PI0_TACTILE_MIN_HOLD_STEPS}"
+            )
+        if deactivated:
             z_msg = "NA" if ee_z is None else f"{ee_z:.4f}"
-            print(f"[TACTILE] Deactivated - pi0 not grasping: {pi0_gripper_raw:.3f}, ee_z={z_msg}")
+            print(
+                "[TACTILE] Deactivated - "
+                f"pi0 not grasping: {pi0_gripper_raw:.3f}, ee_z={z_msg}, "
+                f"release_consec={PI0_TACTILE_RELEASE_CONSEC_STEPS}"
+            )
 
-        self.tactile_active = bool(is_grasping and self.tactile_adapter is not None)
-        self.last_gripper_action = 1.0 if pi0_gripper_raw > self.gripper_bin_threshold else 0.0
+        self.last_gripper_action = 1.0 if (
+            self.tactile_active or (pi0_gripper_raw > self.gripper_bin_threshold)
+        ) else 0.0
 
         # Position-space gripper for RobotEnv(gripper_action_space="position").
-        pi0_gripper_cmd = 1.0 if pi0_gripper_raw > self.gripper_bin_threshold else 0.0
+        pi0_gripper_cmd = 1.0 if (
+            self.tactile_active or (pi0_gripper_raw > self.gripper_bin_threshold)
+        ) else 0.0
 
         action = np.zeros(8, dtype=np.float32)
         action[:7] = np.clip(arm_cmd, -1.0, 1.0)
@@ -1345,9 +1374,25 @@ class HybridPolicy:
         self._safe_action_valid = True
 
         if include_info:
+            contract_active = getattr(self.primary_provider, "io_contract_active", None)
+            contract_switch_count = getattr(self.primary_provider, "_io_contract_switch_count", None)
+            contract_attempts = getattr(self.primary_provider, "_io_contract_attempts", None)
+            last_protocol_error = getattr(self.primary_provider, "_last_protocol_error", None)
+            response_shape = None
+            effective_horizon = None
+            if isinstance(pi0_info, dict):
+                response_shape = pi0_info.get("response_action_shape")
+                effective_horizon = pi0_info.get("effective_open_loop_horizon")
+                contract_active = pi0_info.get("io_contract_active", contract_active)
+                contract_attempts = pi0_info.get("io_contract_attempts", contract_attempts)
+                contract_switch_count = pi0_info.get("io_contract_switch_count", contract_switch_count)
+                last_protocol_error = pi0_info.get("last_protocol_error", last_protocol_error)
+
             info = {
                 "tactile_active": self.tactile_active,
                 "tactile_delta": tactile_delta,
+                "tactile_hold_steps_left": int(self._tactile_hold_steps_left),
+                "tactile_release_streak": int(self._tactile_release_streak),
                 "pi0_gripper_raw": pi0_gripper_raw,
                 "ee_z": ee_z,
                 "pi0_provider": PI0_PROVIDER,
@@ -1355,6 +1400,12 @@ class HybridPolicy:
                 "pi0_fail_count": self._pi0_fail_count,
                 "tactile_fail_count": self._tactile_fail_count,
                 "robot_stopped": self.should_stop,
+                "io_contract_active": contract_active,
+                "io_contract_attempts": contract_attempts,
+                "io_contract_switch_count": contract_switch_count,
+                "last_protocol_error": last_protocol_error,
+                "response_action_shape": response_shape,
+                "effective_open_loop_horizon": effective_horizon,
             }
             return action, info
         return action
@@ -1374,12 +1425,16 @@ class HybridPolicy:
         self._pi0_arm_high_sat_streak = 0
         self._pi0_gripper_counter = 0
         self._pi0_gripper_high_seen = False
+        self._tactile_hold_steps_left = 0
+        self._tactile_release_streak = 0
         self._state_counter = 0
         self._prev_ee_z = None
         self._prev_ee_t = None
         self._low_z_warn_counter = 0
         self._low_z_hard_guard_counter = 0
         self._pos_mode_mismatch_streak = 0
+        self._gripper_semantic_abnormal_streak = 0
+        self._gripper_semantic_warned = False
         self._shadow_count = 0
         self._shadow_linf_samples = []
         self._shadow_l2_samples = []
@@ -1444,6 +1499,12 @@ def main(cfg: DictConfig):
     openpi_config.remote_host = PI0_REMOTE_HOST
     openpi_config.remote_port = PI0_REMOTE_PORT
     openpi_config.open_loop_horizon = PI0_OPEN_LOOP_HORIZON
+    openpi_config.include_tactile_values = PI0_INCLUDE_TACTILE_VALUES
+    openpi_config.include_force_prediction = PI0_INCLUDE_FORCE_PREDICTION
+    openpi_config.io_contract = PI0_IO_CONTRACT
+    openpi_config.io_fallback_order = _parse_io_fallback_order(PI0_IO_FALLBACK_ORDER)
+    openpi_config.protocol_max_retries = PI0_PROTOCOL_MAX_RETRIES
+    openpi_config.protocol_reconnect_on_error = PI0_PROTOCOL_RECONNECT_ON_ERROR
 
     print("Initializing components...")
     print(f"Runtime log: {log_file}")
@@ -1452,6 +1513,17 @@ def main(cfg: DictConfig):
     print(f"PI0 arm action mode: {PI0_ARM_ACTION_MODE}")
     print(f"PI0 joint delta max: {PI0_JOINT_DELTA_MAX}")
     print(f"PI0 open-loop horizon: {PI0_OPEN_LOOP_HORIZON}")
+    print(f"PI0 io contract requested: {openpi_config.io_contract}")
+    print(f"PI0 io fallback order: {openpi_config.io_fallback_order}")
+    print(
+        "PI0 protocol: "
+        f"max_retries={openpi_config.protocol_max_retries}, "
+        f"reconnect_on_error={openpi_config.protocol_reconnect_on_error}"
+    )
+    print(
+        "PI0 legacy include switches: "
+        f"tactile={PI0_INCLUDE_TACTILE_VALUES}, force={PI0_INCLUDE_FORCE_PREDICTION}"
+    )
     if PI0_OPEN_LOOP_HORIZON == 1:
         print(
             "[WARNING] PI0_OPEN_LOOP_HORIZON=1 will execute only the first action of each chunk; "
@@ -1460,6 +1532,12 @@ def main(cfg: DictConfig):
     print(
         f"PI0 gripper thresholds: grasp={PI0_GRASP_THRESHOLD:.3f}, "
         f"hysteresis={PI0_GRASP_HYSTERESIS:.3f}, bin={PI0_GRIPPER_BIN_THRESHOLD:.3f}"
+    )
+    print(
+        "PI0 tactile gate: "
+        f"min_hold_steps={PI0_TACTILE_MIN_HOLD_STEPS}, "
+        f"release_consec={PI0_TACTILE_RELEASE_CONSEC_STEPS}, "
+        f"min_cmd={PI0_TACTILE_GRIPPER_MIN_CMD:.3f}"
     )
     print(
         f"PI0 ee_z guard: warn={PI0_EE_Z_WARN:.4f}, hard_min="
@@ -1504,12 +1582,14 @@ def main(cfg: DictConfig):
         openpi_wrapper = OpenPIWrapper(openpi_config)
         openpi_wrapper.reset()
         print("✓ OpenPI wrapper initialized")
+        _log_pi0_provider_contract_state("OpenPI wrapper", openpi_wrapper)
 
         bridge_provider = None
         if PI0_PROVIDER == "bridge" or PI0_SHADOW_COMPARE:
             bridge_provider = Pi0ActionBridge(openpi_config)
             bridge_provider.reset()
             print("✓ PI0 bridge initialized")
+            _log_pi0_provider_contract_state("PI0 bridge", bridge_provider)
 
         if PI0_PROVIDER == "bridge":
             if bridge_provider is None:
