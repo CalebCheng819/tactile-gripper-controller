@@ -532,6 +532,10 @@ GRASP_STABLE_FORCE_EXIT = 70.0     # unfreeze only when |force| drops below this
 GRASP_STABLE_DELTA_EPS = 0.0005    # applied delta below this = "not moving"
 GRASP_STABLE_FRAMES = 15           # consecutive stable frames to confirm freeze
 GRASP_FREEZE_MIN_FRAMES = 30       # once frozen, hold >= 0.6s before allowing unfreeze
+# Force-zero calibration policy:
+# collect initial force baseline for N steps, then enable normal gripper actions.
+FORCE_ZERO_BASELINE_STEPS = max(1, int(os.getenv("FORCE_ZERO_BASELINE_STEPS", "150")))
+FORCE_ZERO_BLOCK_ACTION_UNTIL_READY = os.getenv("FORCE_ZERO_BLOCK_ACTION_UNTIL_READY", "1") != "0"
 
 # Toggle key
 TOGGLE_KEY = "t"
@@ -556,6 +560,324 @@ PI0_DEBUG_ACTION_PRINT = os.getenv("PI0_DEBUG_ACTION_PRINT", "1") != "0"
 PI0_DEBUG_ACTION_EVERY = max(1, int(os.getenv("PI0_DEBUG_ACTION_EVERY", "1")))
 PI0_DEBUG_ARM_MAP_PRINT = os.getenv("PI0_DEBUG_ARM_MAP_PRINT", "1") != "0"
 PI0_DEBUG_ARM_MAP_EVERY = max(1, int(os.getenv("PI0_DEBUG_ARM_MAP_EVERY", "10")))
+
+# ---------- generalized grasp state machine ----------
+TACTILE_CONTACT_ABS_THR = float(os.getenv("TACTILE_CONTACT_ABS_THR", "0.08"))
+TACTILE_CONTACT_Z_THR = float(os.getenv("TACTILE_CONTACT_Z_THR", "0.12"))
+TACTILE_CONTACT_CONSEC = max(1, int(os.getenv("TACTILE_CONTACT_CONSEC", "4")))
+TACTILE_PEAK_EMA_ALPHA = float(os.getenv("TACTILE_PEAK_EMA_ALPHA", "0.2"))
+TACTILE_PEAK_THR = float(os.getenv("TACTILE_PEAK_THR", "0.012"))
+TACTILE_PEAK_CONSEC = max(1, int(os.getenv("TACTILE_PEAK_CONSEC", "4")))
+TACTILE_PEAK_MIN_PROGRESS = float(os.getenv("TACTILE_PEAK_MIN_PROGRESS", "0.5"))
+TACTILE_TRAJ_NOMINAL_STEPS = max(1, int(os.getenv("TACTILE_TRAJ_NOMINAL_STEPS", "300")))
+TACTILE_HARD_FORCE_ENTER = float(os.getenv("TACTILE_HARD_FORCE_ENTER", "300"))
+TACTILE_HARD_FORCE_EXIT = float(os.getenv("TACTILE_HARD_FORCE_EXIT", "220"))
+TACTILE_HARD_TACTILE_ENTER = float(os.getenv("TACTILE_HARD_TACTILE_ENTER", "0.28"))
+TACTILE_HARD_TACTILE_EXIT = float(os.getenv("TACTILE_HARD_TACTILE_EXIT", "0.20"))
+TACTILE_HARD_MIN_HOLD_FRAMES = max(1, int(os.getenv("TACTILE_HARD_MIN_HOLD_FRAMES", "15")))
+TACTILE_HARD_RELEASE_DELTA = float(os.getenv("TACTILE_HARD_RELEASE_DELTA", "-0.002"))
+TACTILE_FORCE_SOFT = float(os.getenv("TACTILE_FORCE_SOFT", "200"))
+TACTILE_TACTILE_SOFT = float(os.getenv("TACTILE_TACTILE_SOFT", "0.25"))
+TACTILE_SECURE_CONTACT_THR = float(os.getenv("TACTILE_SECURE_CONTACT_THR", "0.18"))
+TACTILE_SECURE_FORCE_STD_THR = float(os.getenv("TACTILE_SECURE_FORCE_STD_THR", "15"))
+TACTILE_SECURE_WINDOW = max(2, int(os.getenv("TACTILE_SECURE_WINDOW", "8")))
+TACTILE_SECURE_MAX_CLOSE_DELTA = float(os.getenv("TACTILE_SECURE_MAX_CLOSE_DELTA", "0.0005"))
+TACTILE_ROBUST_BASELINE_STEPS = max(1, int(os.getenv("TACTILE_ROBUST_BASELINE_STEPS", "30")))
+TACTILE_STATE_LOG_ENABLE = os.getenv("TACTILE_STATE_LOG_ENABLE", "1") != "0"
+TACTILE_STATE_LOG_EVERY = max(1, int(os.getenv("TACTILE_STATE_LOG_EVERY", "1")))
+
+
+class _GraspStateMachineMixin:
+    _GRASP_STATE_TO_CODE = {
+        "APPROACH": 0,
+        "CONTACT": 1,
+        "SECURE": 2,
+    }
+
+    def _init_grasp_state_machine(self, label):
+        self._grasp_label = label
+        self._grasp_state = "APPROACH"
+        self._contact_consec = 0
+        self._peak_consec = 0
+        self._hard_latched = False
+        self._hard_hold_frames = 0
+        self._robust_frozen = False
+        self._traj_step = 0
+        self._contact_peak_ema = 0.0
+        self._contact_peak_raw = 0.0
+        self._tactile_peak_for_protect = 0.0
+        self._contact_abs = 0.0
+        self._contact_z2 = 0.0
+        self._force_mean = float("nan")
+        self._force_max = float("nan")
+        self._risk_score = 0.0
+        self._secure_contact_hist = []
+        self._secure_force_hist = []
+        self._robust_abs_buffer = []
+        self._robust_median = np.zeros(6, dtype=np.float32)
+        self._robust_iqr = np.ones(6, dtype=np.float32)
+        self._grasp_last_info = {}
+        self._state_log_counter = 0
+        self._state_log_path = self._resolve_state_log_path()
+
+    def _reset_grasp_state_machine(self):
+        self._grasp_state = "APPROACH"
+        self._contact_consec = 0
+        self._peak_consec = 0
+        self._hard_latched = False
+        self._hard_hold_frames = 0
+        self._robust_frozen = False
+        self._traj_step = 0
+        self._contact_peak_ema = 0.0
+        self._contact_peak_raw = 0.0
+        self._tactile_peak_for_protect = 0.0
+        self._contact_abs = 0.0
+        self._contact_z2 = 0.0
+        self._force_mean = float("nan")
+        self._force_max = float("nan")
+        self._risk_score = 0.0
+        self._secure_contact_hist.clear()
+        self._secure_force_hist.clear()
+        self._robust_abs_buffer.clear()
+        self._robust_median.fill(0.0)
+        self._robust_iqr.fill(1.0)
+        self._grasp_last_info = {}
+
+    def _resolve_state_log_path(self):
+        if not TACTILE_STATE_LOG_ENABLE:
+            return None
+        explicit = os.getenv("TACTILE_STATE_LOG_PATH", "").strip()
+        if explicit:
+            out = Path(explicit).expanduser()
+            if not out.is_absolute():
+                out = (Path.cwd() / out).resolve()
+        elif _RUN_LOG_PATH:
+            out = Path(_RUN_LOG_PATH).with_suffix(Path(_RUN_LOG_PATH).suffix + ".grasp_state.jsonl")
+        else:
+            log_dir = Path(os.getenv("TACTILE_RUN_LOG_DIR", TACTILE_RUN_LOG_DIR)).expanduser()
+            if not log_dir.is_absolute():
+                log_dir = (Path.cwd() / log_dir).resolve()
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out = log_dir / f"{ts}__{_sanitize_filename(self._grasp_label)}.grasp_state.jsonl"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        return out
+
+    def _configure_force_baseline_warmup(self):
+        adapter = getattr(self, "tactile_adapter", None)
+        if adapter is None:
+            return
+        adapter_cfg = getattr(adapter, "adapter_cfg", None)
+        if adapter_cfg is None:
+            return
+        if not bool(getattr(adapter_cfg, "force_safety_enabled", False)):
+            return
+
+        baseline_steps = int(FORCE_ZERO_BASELINE_STEPS)
+        old_steps = int(max(1, getattr(adapter_cfg, "force_safety_baseline_init_samples", baseline_steps)))
+        adapter_cfg.force_safety_baseline_init_samples = baseline_steps
+        print(
+            "[INFO] Force baseline warmup configured: "
+            f"init_samples {old_steps} -> {baseline_steps}, "
+            f"block_actions_until_ready={FORCE_ZERO_BLOCK_ACTION_UNTIL_READY}"
+        )
+
+    def _to_tactile_history_2d(self, tactile_history):
+        arr = np.asarray(tactile_history, dtype=np.float32)
+        if arr.size == 0:
+            return np.zeros((1, 6), dtype=np.float32)
+        if arr.ndim == 1:
+            if arr.size % 6 == 0:
+                arr = arr.reshape(-1, 6)
+            else:
+                arr = np.pad(arr, (0, max(0, 6 - arr.size)), mode="constant")[:6].reshape(1, 6)
+        elif arr.ndim >= 2:
+            arr = arr.reshape(-1, arr.shape[-1])
+            if arr.shape[1] == 6:
+                pass
+            elif arr.shape[0] == 6 and arr.shape[1] != 6:
+                arr = arr.T
+            elif arr.shape[1] > 6:
+                arr = arr[:, :6]
+            elif arr.shape[1] < 6:
+                arr = np.pad(arr, ((0, 0), (0, 6 - arr.shape[1])), mode="constant")
+        return arr.astype(np.float32, copy=False)
+
+    def _to_force_history_1d(self, force_history):
+        if force_history is None:
+            return np.array([], dtype=np.float32)
+        arr = np.asarray(force_history, dtype=np.float32).reshape(-1)
+        return arr[np.isfinite(arr)]
+
+    def _update_contact_and_force_metrics(self, tactile_history, force_history):
+        tactile_2d = self._to_tactile_history_2d(tactile_history)
+        abs_hist = np.abs(tactile_2d)
+
+        if not self._robust_frozen and self._grasp_state == "APPROACH":
+            self._robust_abs_buffer.append(abs_hist)
+            if len(self._robust_abs_buffer) > TACTILE_ROBUST_BASELINE_STEPS:
+                self._robust_abs_buffer.pop(0)
+
+        if self._robust_abs_buffer:
+            baseline = np.concatenate(self._robust_abs_buffer, axis=0)
+        else:
+            baseline = abs_hist
+
+        q25 = np.percentile(baseline, 25.0, axis=0)
+        q50 = np.percentile(baseline, 50.0, axis=0)
+        q75 = np.percentile(baseline, 75.0, axis=0)
+        self._robust_median = q50.astype(np.float32)
+        self._robust_iqr = np.maximum((q75 - q25), 1e-6).astype(np.float32)
+
+        z = (abs_hist - self._robust_median[None, :]) / self._robust_iqr[None, :]
+        self._contact_abs = float(np.mean(abs_hist > 0.01))
+        self._contact_z2 = float(np.mean(z > 2.0))
+        self._contact_peak_raw = float(np.percentile(abs_hist, 99.0))
+        self._contact_peak_ema = (
+            TACTILE_PEAK_EMA_ALPHA * self._contact_peak_raw
+            + (1.0 - TACTILE_PEAK_EMA_ALPHA) * float(self._contact_peak_ema)
+        )
+        self._tactile_peak_for_protect = float(self._contact_peak_ema)
+
+        force_1d = self._to_force_history_1d(force_history)
+        if force_1d.size:
+            self._force_mean = float(np.mean(force_1d))
+            self._force_max = float(np.max(force_1d))
+        else:
+            self._force_mean = float("nan")
+            self._force_max = float("nan")
+
+        self._traj_step += 1
+        progress = min(1.0, self._traj_step / float(TACTILE_TRAJ_NOMINAL_STEPS))
+
+        main_contact_now = (
+            self._contact_abs >= TACTILE_CONTACT_ABS_THR
+            and self._contact_z2 >= TACTILE_CONTACT_Z_THR
+        )
+        if main_contact_now:
+            self._contact_consec += 1
+        else:
+            self._contact_consec = 0
+
+        peak_contact_now = (
+            progress >= TACTILE_PEAK_MIN_PROGRESS
+            and self._contact_peak_ema >= TACTILE_PEAK_THR
+        )
+        if peak_contact_now:
+            self._peak_consec += 1
+        else:
+            self._peak_consec = 0
+
+        main_triggered = self._contact_consec >= TACTILE_CONTACT_CONSEC
+        peak_triggered = self._peak_consec >= TACTILE_PEAK_CONSEC
+
+        if self._grasp_state == "APPROACH" and (main_triggered or peak_triggered):
+            self._grasp_state = "CONTACT"
+            self._robust_frozen = True
+
+        self._secure_contact_hist.append(self._contact_abs)
+        self._secure_force_hist.append(self._force_mean)
+        if len(self._secure_contact_hist) > TACTILE_SECURE_WINDOW:
+            self._secure_contact_hist.pop(0)
+            self._secure_force_hist.pop(0)
+
+        if self._grasp_state == "CONTACT" and len(self._secure_contact_hist) >= TACTILE_SECURE_WINDOW:
+            contact_mean = float(np.mean(self._secure_contact_hist))
+            force_hist = np.asarray(self._secure_force_hist, dtype=np.float32)
+            finite_force = force_hist[np.isfinite(force_hist)]
+            force_std = float(np.std(finite_force)) if finite_force.size else 0.0
+            if contact_mean >= TACTILE_SECURE_CONTACT_THR and force_std <= TACTILE_SECURE_FORCE_STD_THR:
+                self._grasp_state = "SECURE"
+
+    def _update_hard_protect_latch(self):
+        force_hit = np.isfinite(self._force_max) and self._force_max >= TACTILE_HARD_FORCE_ENTER
+        tactile_hit = self._tactile_peak_for_protect >= TACTILE_HARD_TACTILE_ENTER
+        if not self._hard_latched and (force_hit or tactile_hit):
+            self._hard_latched = True
+            self._hard_hold_frames = 0
+
+        if self._hard_latched:
+            self._hard_hold_frames += 1
+            force_clear = (not np.isfinite(self._force_max)) or (self._force_max <= TACTILE_HARD_FORCE_EXIT)
+            tactile_clear = self._tactile_peak_for_protect <= TACTILE_HARD_TACTILE_EXIT
+            if (
+                self._hard_hold_frames >= TACTILE_HARD_MIN_HOLD_FRAMES
+                and force_clear
+                and tactile_clear
+            ):
+                self._hard_latched = False
+                self._hard_hold_frames = 0
+
+    def _apply_grasp_state_delta_postprocess(self, delta):
+        delta = float(delta)
+        force_ratio = 0.0
+        if np.isfinite(self._force_max):
+            force_ratio = max(0.0, self._force_max / max(TACTILE_FORCE_SOFT, 1e-6))
+        tactile_ratio = max(0.0, self._tactile_peak_for_protect / max(TACTILE_TACTILE_SOFT, 1e-6))
+        self._risk_score = float(np.clip(max(force_ratio, tactile_ratio), 0.0, 1.0))
+
+        if self._grasp_state in {"CONTACT", "SECURE"} and delta > 0:
+            delta *= (1.0 - self._risk_score)
+
+        if self._grasp_state == "SECURE" and delta > TACTILE_SECURE_MAX_CLOSE_DELTA:
+            delta = TACTILE_SECURE_MAX_CLOSE_DELTA
+
+        self._update_hard_protect_latch()
+        if self._hard_latched and delta > 0.0:
+            delta = TACTILE_HARD_RELEASE_DELTA
+
+        return float(delta)
+
+    def _record_grasp_step(self, payload):
+        self._grasp_last_info = {
+            "grasp_state": self._grasp_state,
+            "contact_abs": float(self._contact_abs),
+            "contact_z2": float(self._contact_z2),
+            "contact_peak_raw": float(self._contact_peak_raw),
+            "contact_peak_ema": float(self._contact_peak_ema),
+            "contact_consec_count": int(self._contact_consec),
+            "peak_consec_count": int(self._peak_consec),
+            "hard_protect_latched": bool(self._hard_latched),
+            "hard_protect_hold_frames": int(self._hard_hold_frames),
+            "force_mean": float(self._force_mean) if np.isfinite(self._force_mean) else None,
+            "force_max": float(self._force_max) if np.isfinite(self._force_max) else None,
+            "risk_score": float(self._risk_score),
+            "delta_model_raw": float(payload.get("delta_model_raw", 0.0)),
+            "delta_after_small_delta_gate": float(payload.get("delta_after_small_delta_gate", 0.0)),
+            "delta_after_force_safety": float(payload.get("delta_after_force_safety", 0.0)),
+            "delta_final_applied": float(payload.get("delta_final_applied", 0.0)),
+        }
+
+        if not self._state_log_path:
+            return
+        self._state_log_counter += 1
+        if self._state_log_counter % TACTILE_STATE_LOG_EVERY != 0:
+            return
+
+        rec = dict(self._grasp_last_info)
+        rec["step"] = int(self._traj_step)
+        rec["controller"] = self._grasp_label
+        rec["timestamp"] = time.time()
+        try:
+            with self._state_log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=True) + "\n")
+        except Exception as e:
+            if not hasattr(self, "_state_log_warned"):
+                print(f"[WARNING] Failed to write tactile state log: {e}")
+                self._state_log_warned = True
+
+    def _append_grasp_info(self, info):
+        if info is None:
+            info = {}
+        grasp_state_code = self._GRASP_STATE_TO_CODE.get(self._grasp_state, -1)
+        info.update({
+            "grasp_state_code": int(grasp_state_code),
+            "contact_abs": float(self._contact_abs),
+            "contact_z2": float(self._contact_z2),
+            "contact_peak_ema": float(self._contact_peak_ema),
+            "hard_protect_latched": bool(self._hard_latched),
+            "contact_consec_count": int(self._contact_consec),
+        })
+        return info
 
 
 class babyFORTEReader:
@@ -655,7 +977,7 @@ class babyFORTEReader:
         print("Demo completed. Resources cleaned up.")
 
 
-class Pi0ArmTactileGripperController:
+class Pi0ArmTactileGripperController(_GraspStateMachineMixin):
     """
     PI0 policy controls arm motion with manual override; tactile model closes the gripper.
 
@@ -686,6 +1008,7 @@ class Pi0ArmTactileGripperController:
         self._timing_counter = 0
         self._pi0_debug_counter = 0
         self._pi0_arm_map_counter = 0
+        self._print_counter = 0
         self._pi0_arm_ema = np.zeros(7, dtype=np.float32)
         self._pi0_arm_prev = np.zeros(7, dtype=np.float32)
 
@@ -701,6 +1024,8 @@ class Pi0ArmTactileGripperController:
 
         # Same delta threshold used in the manual controller.
         self.DELTA_THRESHOLD = 0.000356
+        self._init_grasp_state_machine("pi0_tactile")
+        self._configure_force_baseline_warmup()
 
         print(f"\n{'='*70}")
         print("PI0 + TACTILE CONTROLLER")
@@ -987,6 +1312,7 @@ class Pi0ArmTactileGripperController:
         self._grasp_stable_counter = 0
         self._ema_frozen = False
         self._ema_freeze_held = 0
+        self._reset_grasp_state_machine()
 
     def _set_tactile_enabled(self, enabled):
         enabled = bool(enabled)
@@ -994,6 +1320,7 @@ class Pi0ArmTactileGripperController:
             return
         self.tactile_enabled = enabled
         if enabled:
+            self._reset_grasp_state_machine()
             if self.tactile_adapter is not None:
                 self.tactile_adapter.reset_force_safety_state()
         else:
@@ -1069,6 +1396,8 @@ class Pi0ArmTactileGripperController:
                 force_read_ms = (force_done - force_start) * 1000.0
                 t_after_force_ms = (force_done - teleop_t0) * 1000.0
 
+            self._update_contact_and_force_metrics(tactile_history, force_history)
+
             gripper_pos = obs_dict.get("gripper_position") or robot_state.get("gripper_position", [0.0])
             if isinstance(gripper_pos, (list, np.ndarray)):
                 current_gripper = float(gripper_pos[0])
@@ -1092,7 +1421,13 @@ class Pi0ArmTactileGripperController:
                 t_model_end_ms = (model_done - teleop_t0) * 1000.0
                 timings = getattr(self.tactile_adapter, "last_timings", {}) or {}
 
+                delta_model_raw = 0.0
+                delta_after_small_gate = 0.0
+                delta_after_force_safety = 0.0
+                delta_final_applied = 0.0
+
                 delta = float(model_delta)
+                delta_model_raw = float(delta)
 
                 raw_delta = delta
                 if abs(delta) < self.DELTA_THRESHOLD:
@@ -1101,6 +1436,7 @@ class Pi0ArmTactileGripperController:
                         self._print_counter = 0
                     if self._print_counter % 100 == 0:
                         print(f"[SAFETY] Suppressed small delta: {raw_delta:.6f} (threshold: {self.DELTA_THRESHOLD:.6f})")
+                delta_after_small_gate = float(delta)
 
                 predicted_force = None
                 last_outputs = getattr(self.tactile_adapter, "last_model_outputs", {}) or {}
@@ -1122,7 +1458,12 @@ class Pi0ArmTactileGripperController:
                     force_history=force_history,
                     predicted_force=predicted_force,
                 )
-                if not force_safety_info.get("baseline_init_done", True):
+                delta_after_force_safety = float(delta)
+                baseline_init_done = bool(force_safety_info.get("baseline_init_done", True))
+                baseline_block_active = bool(
+                    (not baseline_init_done) and FORCE_ZERO_BLOCK_ACTION_UNTIL_READY
+                )
+                if not baseline_init_done:
                     if not hasattr(self, "_print_counter"):
                         self._print_counter = 0
                     if self._print_counter % 10 == 0:
@@ -1130,11 +1471,17 @@ class Pi0ArmTactileGripperController:
                         _bl = force_safety_info.get("baseline")
                         _corr = force_safety_info.get("force_corrected")
                         _filt = force_safety_info.get("force")
+                        _bc = force_safety_info.get("baseline_count")
+                        _br = force_safety_info.get("baseline_required")
                         print(
                             f"[FORCE BASELINE INIT] "
                             f"raw={_raw:.1f}, baseline={_bl}, "
-                            f"corrected={_corr:.1f}, filtered={_filt:.1f}"
+                            f"corrected={_corr:.1f}, filtered={_filt:.1f}, "
+                            f"count={_bc}/{_br}"
                         )
+                if baseline_block_active:
+                    delta = 0.0
+                    delta_after_force_safety = 0.0
                 elif force_safety_info.get("triggered") and getattr(self, "_print_counter", 0) % 30 == 0:
                     reason = force_safety_info.get("reason")
                     force_now = force_safety_info.get("force")
@@ -1148,7 +1495,9 @@ class Pi0ArmTactileGripperController:
                 if force_safety_info.get("triggered"):
                     self._force_cooldown_counter = FORCE_SAFETY_COOLDOWN_FRAMES
 
-                if self._force_cooldown_counter > 0:
+                if baseline_block_active:
+                    delta = 0.0
+                elif self._force_cooldown_counter > 0:
                     self._force_cooldown_counter -= 1
                     delta = 0.0
                 else:
@@ -1228,7 +1577,9 @@ class Pi0ArmTactileGripperController:
                                             f"frozen={self._ema_frozen}"
                                         )
 
+                delta = self._apply_grasp_state_delta_postprocess(delta)
                 delta = self._clamp_gripper_delta(delta)
+                delta_final_applied = float(delta)
 
                 action_space = self.hitl_policy.robot_env.action_space if hasattr(self.hitl_policy, "robot_env") else "joint_velocity"
 
@@ -1266,6 +1617,13 @@ class Pi0ArmTactileGripperController:
                         print(f"[TACTILE MODEL ACTIVE] Gripper: {current_gripper:.3f} -> {target_gripper:.3f} "
                               f"(delta: {delta:+.4f}, model_delta: {model_delta:+.4f}"
                               f"{ft_str}{ema_str})")
+
+                self._record_grasp_step({
+                    "delta_model_raw": delta_model_raw,
+                    "delta_after_small_delta_gate": delta_after_small_gate,
+                    "delta_after_force_safety": delta_after_force_safety,
+                    "delta_final_applied": delta_final_applied,
+                })
 
                 if self._timing_enabled:
                     self._timing_counter += 1
@@ -1388,7 +1746,7 @@ class Pi0ArmTactileGripperController:
         action = self._apply_tactile_override(obs_dict, action, teleop_t0, teleop_ms)
 
         if include_info:
-            return action, info
+            return action, self._append_grasp_info(info)
         return action
 
     def reset_state(self):
@@ -1401,6 +1759,7 @@ class Pi0ArmTactileGripperController:
         self._reset_pi0_arm_filter()
         self._reset_tactile_state()
         self.tactile_enabled = False
+        self._reset_grasp_state_machine()
 
     def set_instruction(self, instruction):
         self._instruction = instruction
@@ -1413,7 +1772,7 @@ class Pi0ArmTactileGripperController:
         return self.hitl_policy.get_info()
 
 
-class TactileGripperController:
+class TactileGripperController(_GraspStateMachineMixin):
     """
     Wrapper around HITLPolicy that adds tactile model gripper control toggle.
     
@@ -1463,6 +1822,8 @@ class TactileGripperController:
         # Alternative thresholds:
         # self.DELTA_THRESHOLD = 0.006  # Less strict - some unwanted motions may pass
         # self.DELTA_THRESHOLD = 0.01   # Very strict - suppresses delta < 0.01
+        self._init_grasp_state_machine("manual_tactile")
+        self._configure_force_baseline_warmup()
         
         print(f"\n{'='*70}")
         print("🤖 TACTILE MODEL GRIPPER CONTROL")
@@ -1495,6 +1856,7 @@ class TactileGripperController:
                 print("   The tactile model will now control the gripper automatically!")
                 print("   You control the arm with SpaceMouse, model controls gripper.")
                 self.tactile_adapter.reset_force_safety_state()
+                self._reset_grasp_state_machine()
             else:
                 print("TACTILE MODEL DISABLED - MANUAL CONTROL ")
                 print("   Gripper control returned to manual mode.")
@@ -1505,6 +1867,7 @@ class TactileGripperController:
                 self._grasp_stable_counter = 0
                 self._ema_frozen = False
                 self._ema_freeze_held = 0
+                self._reset_grasp_state_machine()
             print("="*70 + "\n")
             toggled = True
         
@@ -1548,6 +1911,8 @@ class TactileGripperController:
         
         # If model is disabled, return action as-is
         if not self.model_enabled:
+            if include_info:
+                return action, self._append_grasp_info(info)
             return base_action
         
         # Model is enabled: override gripper with tactile model prediction
@@ -1662,6 +2027,8 @@ class TactileGripperController:
                 force_done = time.perf_counter()
                 force_read_ms = (force_done - force_start) * 1000.0
                 t_after_force_ms = (force_done - teleop_t0) * 1000.0
+
+            self._update_contact_and_force_metrics(tactile_history, force_history)
             
             # Get current gripper position
             gripper_pos = obs_dict.get("gripper_position") or robot_state.get("gripper_position", [0.0])
@@ -1690,8 +2057,14 @@ class TactileGripperController:
                 t_model_end_ms = (model_done - teleop_t0) * 1000.0
                 timings = getattr(self.tactile_adapter, "last_timings", {}) or {}
 
+                delta_model_raw = 0.0
+                delta_after_small_gate = 0.0
+                delta_after_force_safety = 0.0
+                delta_final_applied = 0.0
+
                 
                 delta = float(model_delta)
+                delta_model_raw = float(delta)
                 
                 # Safety mechanism: If delta is very small (near zero), don't apply it
                 # This helps prevent unwanted gripper movements when no target object is present
@@ -1704,6 +2077,7 @@ class TactileGripperController:
                     # Debug: Print when delta is suppressed (every 100 steps to avoid spam)
                     if self._print_counter % 100 == 0:
                         print(f"[SAFETY] Suppressed small delta: {raw_delta:.6f} (threshold: {self.DELTA_THRESHOLD:.6f})")
+                delta_after_small_gate = float(delta)
 
                 # Retrieve auxiliary model outputs (force, final_target).
                 predicted_force = None
@@ -1726,17 +2100,28 @@ class TactileGripperController:
                     force_history=force_history,
                     predicted_force=predicted_force,
                 )
-                if not force_safety_info.get("baseline_init_done", True):
+                delta_after_force_safety = float(delta)
+                baseline_init_done = bool(force_safety_info.get("baseline_init_done", True))
+                baseline_block_active = bool(
+                    (not baseline_init_done) and FORCE_ZERO_BLOCK_ACTION_UNTIL_READY
+                )
+                if not baseline_init_done:
                     if self._print_counter % 10 == 0:
                         _raw = force_safety_info.get("raw_force")
                         _bl = force_safety_info.get("baseline")
                         _corr = force_safety_info.get("force_corrected")
                         _filt = force_safety_info.get("force")
+                        _bc = force_safety_info.get("baseline_count")
+                        _br = force_safety_info.get("baseline_required")
                         print(
                             f"[FORCE BASELINE INIT] "
                             f"raw={_raw:.1f}, baseline={_bl}, "
-                            f"corrected={_corr:.1f}, filtered={_filt:.1f}"
+                            f"corrected={_corr:.1f}, filtered={_filt:.1f}, "
+                            f"count={_bc}/{_br}"
                         )
+                if baseline_block_active:
+                    delta = 0.0
+                    delta_after_force_safety = 0.0
                 elif force_safety_info.get("triggered") and self._print_counter % 30 == 0:
                     reason = force_safety_info.get("reason")
                     force_now = force_safety_info.get("force")
@@ -1751,7 +2136,9 @@ class TactileGripperController:
                 if force_safety_info.get("triggered"):
                     self._force_cooldown_counter = FORCE_SAFETY_COOLDOWN_FRAMES
 
-                if self._force_cooldown_counter > 0:
+                if baseline_block_active:
+                    delta = 0.0
+                elif self._force_cooldown_counter > 0:
                     self._force_cooldown_counter -= 1
                     delta = 0.0
                 else:
@@ -1839,7 +2226,9 @@ class TactileGripperController:
                                         )
 
                 # ===== STEP 7: final clamp (covers both main delta and fallback) =====
+                delta = self._apply_grasp_state_delta_postprocess(delta)
                 delta = self._clamp_gripper_delta(delta)
+                delta_final_applied = float(delta)
 
                 # Check action space to determine if we need velocity or position command
                 # When action_space is "joint_velocity", gripper action is interpreted as velocity
@@ -1896,6 +2285,13 @@ class TactileGripperController:
                         print(f"[TACTILE MODEL ACTIVE] Gripper: {current_gripper:.3f} → {target_gripper:.3f} "
                               f"(delta: {delta:+.4f}, model_delta: {model_delta:+.4f}"
                               f"{ft_str}{ema_str})")
+
+                self._record_grasp_step({
+                    "delta_model_raw": delta_model_raw,
+                    "delta_after_small_delta_gate": delta_after_small_gate,
+                    "delta_after_force_safety": delta_after_force_safety,
+                    "delta_final_applied": delta_final_applied,
+                })
 
                 if self._timing_enabled:
                     self._timing_counter += 1
@@ -1955,7 +2351,7 @@ class TactileGripperController:
             traceback.print_exc()
         
         if include_info:
-            return action, info
+            return action, self._append_grasp_info(info)
         else:
             return action
 
@@ -1964,6 +2360,7 @@ class TactileGripperController:
         self.hitl_policy.reset_state()
         self.model_enabled = False
         self._last_toggle_state = False
+        self._reset_grasp_state_machine()
 
     def set_instruction(self, instruction):
         """Set instruction (for compatibility with HITLPolicy)."""
