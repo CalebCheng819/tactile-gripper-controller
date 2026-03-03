@@ -582,6 +582,8 @@ TACTILE_SECURE_CONTACT_THR = float(os.getenv("TACTILE_SECURE_CONTACT_THR", "0.18
 TACTILE_SECURE_FORCE_STD_THR = float(os.getenv("TACTILE_SECURE_FORCE_STD_THR", "15"))
 TACTILE_SECURE_WINDOW = max(2, int(os.getenv("TACTILE_SECURE_WINDOW", "8")))
 TACTILE_SECURE_MAX_CLOSE_DELTA = float(os.getenv("TACTILE_SECURE_MAX_CLOSE_DELTA", "0.0005"))
+TACTILE_CONTACT_MAX_CLOSE_DELTA = float(os.getenv("TACTILE_CONTACT_MAX_CLOSE_DELTA", "0.0003"))
+TACTILE_SECURE_BLOCK_POSITIVE = os.getenv("TACTILE_SECURE_BLOCK_POSITIVE", "1") != "0"
 TACTILE_ROBUST_BASELINE_STEPS = max(1, int(os.getenv("TACTILE_ROBUST_BASELINE_STEPS", "30")))
 TACTILE_STATE_LOG_ENABLE = os.getenv("TACTILE_STATE_LOG_ENABLE", "1") != "0"
 TACTILE_STATE_LOG_EVERY = max(1, int(os.getenv("TACTILE_STATE_LOG_EVERY", "1")))
@@ -818,8 +820,14 @@ class _GraspStateMachineMixin:
         if self._grasp_state in {"CONTACT", "SECURE"} and delta > 0:
             delta *= (1.0 - self._risk_score)
 
-        if self._grasp_state == "SECURE" and delta > TACTILE_SECURE_MAX_CLOSE_DELTA:
-            delta = TACTILE_SECURE_MAX_CLOSE_DELTA
+        if self._grasp_state == "CONTACT" and delta > TACTILE_CONTACT_MAX_CLOSE_DELTA:
+            delta = TACTILE_CONTACT_MAX_CLOSE_DELTA
+
+        if self._grasp_state == "SECURE" and delta > 0.0:
+            if TACTILE_SECURE_BLOCK_POSITIVE:
+                delta = 0.0
+            elif delta > TACTILE_SECURE_MAX_CLOSE_DELTA:
+                delta = TACTILE_SECURE_MAX_CLOSE_DELTA
 
         self._update_hard_protect_latch()
         if self._hard_latched and delta > 0.0:
