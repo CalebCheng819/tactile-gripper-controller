@@ -543,7 +543,7 @@ TOGGLE_KEY = "t"
 # PI0 policy integration (arm control + gripper gating)
 PI0_REMOTE_HOST = os.getenv("PI0_REMOTE_HOST", "127.0.1.1").strip()
 PI0_REMOTE_PORT = int(os.getenv("PI0_REMOTE_PORT", "8000"))
-PI0_OPEN_LOOP_HORIZON = int(os.getenv("PI0_OPEN_LOOP_HORIZON", "1"))
+PI0_OPEN_LOOP_HORIZON = int(os.getenv("PI0_OPEN_LOOP_HORIZON", "8"))
 PI0_ARM_ACTION_MODE = os.getenv("PI0_ARM_ACTION_MODE", "joint_position").strip().lower()
 PI0_ARM_SWITCH_SEC = float(os.getenv("PI0_ARM_SWITCH_SEC", "0.35"))
 PI0_OVERRIDE_KEY = os.getenv("PI0_OVERRIDE_KEY", "p").strip() or "p"
